@@ -1,2 +1,12 @@
 # GPT_Playground
-This projects implements a toy-example of GPT-2 with additional bells and whistles like Mixture-of-Experts and MAMBA blocks. 
+This projects implements a toy-example of GPT-2 with additional bells and whistles like Mixture-of-Experts and MAMBA 
+blocks.  To get started, this repo uses [Karpathy's nanoGPT](https://github.com/karpathy/nanoGPT) repository. 
+
+## Training data
+To train a language model of GPT variant, this repo uses Harry Potter books. The dataset is already preprocessed, and it
+can be found on [Kaggle](https://www.kaggle.com/datasets/moxxis/harry-potter-lstm).
+
+ToDo:\
+[ ] Implement MoE blocks to convert Standard GPT into an Sparse MoE based language model\
+[ ] Implement MAMBA block as an alternative to regular transformer block\
+[ ] Implement evaluation mechanism (perplexity)
