@@ -1,15 +1,18 @@
 """
 provides utilities to train nano-GPT
 """
+import os
 from tqdm import tqdm
 from loguru import logger
+import yaml
 
 import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from dataset import HarryPotterDataSet
-from model import NanoGPT
+from model.nano_gpt import NanoGPT
 
+os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
 
 def estimate_loss(logits, gt):
     B, T, C = logits.shape
@@ -86,15 +89,20 @@ if __name__ == "__main__":
     torch.manual_seed(1337)
 
     train_dataset = HarryPotterDataSet("Harry_Potter_all_books_preprocessed.txt", "train",
-                                       block_size, tokenizer="tiktoken")
+                                       block_size, tokenizer="char")
     train_dataloader = DataLoader(train_dataset, batch_size, shuffle=True, num_workers=12, pin_memory=True)
 
     val_dataset = HarryPotterDataSet("Harry_Potter_all_books_preprocessed.txt", "val",
-                                     block_size, tokenizer="tiktoken")
+                                     block_size, tokenizer="char")
     val_dataloader = DataLoader(val_dataset, batch_size, shuffle=True, num_workers=12, pin_memory=True)
 
-    nano_gpt = NanoGPT(n_layer, n_embd, n_head, block_size, train_dataset.vocab_size)
-    nano_gpt.to(device)
+    # reading model configs
+    with open("configs/model_config.yaml", "r") as mcf:
+        model_configs = yaml.safe_load(mcf)
+
+    model_configs["vocab_size"] = train_dataset.vocab_size
+    # creating model instance
+    nano_gpt = NanoGPT(model_configs)
     nano_gpt.to(device)
 
     #context = train_dataset.encode("Dumbledore turned and walked")

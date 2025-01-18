@@ -1,0 +1,10 @@
+
+num_blocks: 6
+num_layers: 8
+emb_dim: 64
+num_heads: 8
+block_size: 32
+vocab_size: 0  # to be set after train dataset creation, for now
+is_moe: True
+num_experts: 4
+num_topk: 2
