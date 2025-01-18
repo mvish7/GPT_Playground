@@ -1,7 +1,7 @@
 """
 implements a gpt2-nano model
 """
-
+import yaml
 import torch
 import torch.nn as nn
 
@@ -9,22 +9,25 @@ from model.gpt_blocks import TransformerBlock
 
 
 class NanoGPT(nn.Module):
-    def __init__(self, num_blocks, emb_dim, num_heads, block_size, vocab_size):
+    def __init__(self, configs):
         super().__init__()
-        self.block_size = block_size
-        self.token_embedding = nn.Embedding(vocab_size, emb_dim)
+        self.block_size = configs["block_size"]
+        self.token_embedding = nn.Embedding(configs["vocab_size"], configs["emb_dim"])
         # positional embeddings -- as a  block_size of input will be fed to n/w at a time,shape of block_size.
-        self.positional_embedding = nn.Embedding(block_size, emb_dim)
+        self.positional_embedding = nn.Embedding(configs["block_size"], configs["emb_dim"])
         # all transformer blocks stacked together
-        self.blocks = nn.Sequential(*[TransformerBlock(emb_dim, num_heads, block_size) for _ in range(num_blocks)])
+        self.blocks = nn.Sequential(*[TransformerBlock(configs) for _ in range(configs["num_blocks"])])
         # final prediction over all words in the vocab
-        self.lm_pred = nn.Linear(emb_dim, vocab_size)
+        self.lm_pred = nn.Linear(configs["emb_dim"], configs["vocab_size"])
 
     def forward(self, x):
+        # x = x.to("cpu")
         B, T = x.shape
 
         token_emb = self.token_embedding(x)
-        pos_emb = self.positional_embedding(torch.arange(T, device="cuda"))
+
+        pos_emb_seq = torch.arange(T).to("cuda")
+        pos_emb = self.positional_embedding(pos_emb_seq)
         x = token_emb + pos_emb
         x = self.blocks(x)
         x = self.lm_pred(x)
@@ -102,8 +105,12 @@ class NanoGPT(nn.Module):
 
 
 if __name__ == "__main__":
-    ip = torch.randn((4, 8, 32))
+    with open("../configs/model_config.yaml", "r") as mcf:
+        model_configs = yaml.safe_load(mcf)
 
-    msa = NanoGPT(6, 64, 8, 8, 50)
+    ip = torch.randn((2, 32))
+    ip = ip.to(torch.int64)
+
+    msa = NanoGPT(model_configs)
     op = msa(ip)
     a = 1
