@@ -9,7 +9,7 @@ import torch.nn.functional as torch_f
 from model.moe_blocks import SparseMoe
 
 
-class SelfAttention(nn.Module):
+class Attention(nn.Module):
     def __init__(self, emb_dim, head_dim, block_size):
         super().__init__()
         self.head_dim = head_dim
@@ -22,11 +22,15 @@ class SelfAttention(nn.Module):
         self.dropout = nn.Dropout(p=0.5)
 
     def forward(self, x):
+        q = self.query(x)
+        k = self.key(x)
+        v = self.value(x)
+        return self.self_attention(x, q, k, v)
+
+    def self_attention(self, x, query_vec, key_vec, value_vec):
         b, t, c = x.shape
         # all with shape B, T, C
-        query_vec = self.query(x)
-        key_vec = self.key(x)
-        value_vec = self.value(x)
+
         # dot product between (B, T, C) and (B, C, T) -> (B, T, T)
         scaled_dot_prod = (query_vec @ key_vec.transpose(-2, -1)) * (self.head_dim**-0.5)
         # masking to conceal "future" tokens
@@ -42,7 +46,7 @@ class MultiHeadAttention(nn.Module):
     def __init__(self, num_heads, emb_dim, block_size):
         super().__init__()
 
-        self.mh_sa = nn.ModuleList([SelfAttention(emb_dim, emb_dim//num_heads, block_size) for _ in range(num_heads)])
+        self.mh_sa = nn.ModuleList([Attention(emb_dim, emb_dim//num_heads, block_size) for _ in range(num_heads)])
         self.proj = nn.Linear(emb_dim, emb_dim)
         self.dropout = nn.Dropout(p=0.5)
 
@@ -50,6 +54,29 @@ class MultiHeadAttention(nn.Module):
         x = torch.cat([head(x) for head in self.mh_sa], dim=-1)
         x = self.dropout(self.proj(x))
         return x
+
+
+class MultiQueryAttention(Attention):
+    """
+    implement MQA from the paper https://arxiv.org/abs/1911.02150
+    """
+    def __init__(self, num_heads, emb_dim, block_size):
+        super().__init__(emb_dim, emb_dim//num_heads, block_size)
+        delattr(self, "query")
+
+        self.queries = nn.ModuleList([nn.Linear(emb_dim, emb_dim//num_heads, bias=False) for _ in range(num_heads)])
+        self.key = nn.Linear(emb_dim, emb_dim//num_heads, bias=False)
+        self.values = nn.Linear(emb_dim, emb_dim // num_heads, bias=False)
+
+        self.proj = nn.Linear(emb_dim*num_heads, emb_dim)
+        self.dropout = nn.Dropout(p=0.5)
+
+    def forward(self, x):
+        v_vec = self.values(x)
+        k_vec = self.key(x)
+
+        x = torch.cat([self.self_attention(x, q_vec(x), k_vec, v_vec)for  q_vec in self.queries], dim=1)
+        return self.dropout(self.proj(x))
 
 
 class FeedForward(nn.Module):
