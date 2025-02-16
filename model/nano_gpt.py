@@ -108,9 +108,10 @@ if __name__ == "__main__":
     with open("../configs/model_config.yaml", "r") as mcf:
         model_configs = yaml.safe_load(mcf)
 
-    ip = torch.randn((2, 32))
+    model_configs["vocab_size"] = 71  # simulate harry_potter_text data vocab_size
+    ip = torch.randint(0, 10, (2, 32)).to("cuda")
     ip = ip.to(torch.int64)
 
-    msa = NanoGPT(model_configs)
+    msa = NanoGPT(model_configs).to("cuda")
     op = msa(ip)
     a = 1

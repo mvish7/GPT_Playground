@@ -68,14 +68,51 @@ class MultiQueryAttention(Attention):
         self.key = nn.Linear(emb_dim, emb_dim//num_heads, bias=False)
         self.values = nn.Linear(emb_dim, emb_dim // num_heads, bias=False)
 
-        self.proj = nn.Linear(emb_dim*num_heads, emb_dim)
+        self.proj = nn.Linear(emb_dim, emb_dim)
         self.dropout = nn.Dropout(p=0.5)
 
     def forward(self, x):
         v_vec = self.values(x)
         k_vec = self.key(x)
 
-        x = torch.cat([self.self_attention(x, q_vec(x), k_vec, v_vec)for  q_vec in self.queries], dim=1)
+        x = torch.cat([self.self_attention(x, q_vec(x), k_vec, v_vec)for  q_vec in self.queries], dim=-1)
+        return self.dropout(self.proj(x))
+
+
+class GroupQueryAttention(Attention):
+    def __init__(self, num_heads, num_groups, emb_dim, block_size):
+        super().__init__(emb_dim, emb_dim // num_heads, block_size)
+        if num_heads % num_groups != 0:
+            raise ValueError("Number of heads must be divisible by number of groups")
+
+        delattr(self, "query")  # Remove the individual query from base class
+
+        self.num_groups = num_groups
+        self.group_size = num_heads // num_groups  # Heads per group
+
+        self.queries = nn.ModuleList([nn.Linear(emb_dim, emb_dim // num_heads, bias=False) for _ in range(num_heads)])
+        # single k-v per group
+        self.keys = nn.ModuleList([nn.Linear(emb_dim, emb_dim // num_heads, bias=False) for _ in range(num_groups)])
+        self.values = nn.ModuleList([nn.Linear(emb_dim, emb_dim // num_heads, bias=False) for _ in range(num_groups)])
+
+        self.proj = nn.Linear(emb_dim, emb_dim)
+        self.dropout = nn.Dropout(p=0.5)
+
+    def forward(self, x):
+        all_head_outputs = []
+
+        for g in range(self.num_groups):
+            # shared K vector for group g
+            k_vec = self.keys[g](x)
+            v_vec = self.values[g](x)
+
+            for h in range(self.group_size):
+                head_idx = g * self.group_size + h  # Calculate head index
+                q_vec = self.queries[head_idx](x)  # Query for this specific head
+                head_output = self.self_attention(x, q_vec, k_vec, v_vec)  # Use group's K and V
+                all_head_outputs.append(head_output)
+
+        x = torch.cat(all_head_outputs, dim=-1)
         return self.dropout(self.proj(x))
 
 
@@ -97,9 +134,14 @@ class FeedForward(nn.Module):
 class TransformerBlock(nn.Module):
     def __init__(self, configs):
         super().__init__()
-        # configs["emb_dim"], configs["num_heads"],
-        # configs["block_size"]
-        self.mh_sa = MultiHeadAttention(configs["num_heads"], configs["emb_dim"], configs["block_size"])
+        if configs["attention"] == "vanilla":
+            self.attn = MultiHeadAttention(configs["num_heads"], configs["emb_dim"], configs["block_size"])
+        elif configs["attention"] == "multi_query":
+            self.attn = MultiQueryAttention(configs["num_heads"], configs["emb_dim"], configs["block_size"])
+        elif configs["attention"] == "group_query":
+            self.attn = GroupQueryAttention(configs["num_heads"], configs["emb_dim"], configs["block_size"],
+                                            configs["num_groups"])
+
         self.norm1 = nn.LayerNorm(configs["emb_dim"])
         if configs["is_moe"]:
             self.ffw = SparseMoe(configs["num_experts"], configs["num_topk"], configs["emb_dim"])
@@ -109,7 +151,7 @@ class TransformerBlock(nn.Module):
 
     def forward(self, x):
 
-        x = x + self.mh_sa(x)
+        x = x + self.attn(x)
         x = self.norm1(x)
         x = x + self.ffw(x)
         x = self.norm2(x)
