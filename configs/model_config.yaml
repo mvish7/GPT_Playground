@@ -10,3 +10,7 @@ vocab_size: 0  # to be set after train dataset creation, for now
 is_moe: False  # True or False
 num_experts: 4
 num_topk: 2
+multi_toke_pred:
+  do_mtp: True
+  total_num_token: 3
+  num_tx_head: 2  # num_head for transformer layer inside the MTP module

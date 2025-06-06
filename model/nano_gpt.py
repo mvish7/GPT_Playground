@@ -6,19 +6,24 @@ import torch
 import torch.nn as nn
 
 from model.gpt_blocks import TransformerBlock
+from model.multi_token_prediction import MultiTokenPred
 
 
 class NanoGPT(nn.Module):
     def __init__(self, configs):
         super().__init__()
+        self.configs = configs
         self.block_size = configs["block_size"]
         self.token_embedding = nn.Embedding(configs["vocab_size"], configs["emb_dim"])
         # positional embeddings -- as a  block_size of input will be fed to n/w at a time,shape of block_size.
         self.positional_embedding = nn.Embedding(configs["block_size"], configs["emb_dim"])
         # all transformer blocks stacked together
         self.blocks = nn.Sequential(*[TransformerBlock(configs) for _ in range(configs["num_blocks"])])
-        # final prediction over all words in the vocab
-        self.lm_pred = nn.Linear(configs["emb_dim"], configs["vocab_size"])
+        if configs["multi_token_pred"]["do_mtp"]:
+            self.mtp_head = MultiTokenPred(configs)
+        else:
+            # final prediction over all words in the vocab
+            self.lm_pred = nn.Linear(configs["emb_dim"], configs["vocab_size"])
 
     def forward(self, x):
         # x = x.to("cpu")
@@ -30,7 +35,10 @@ class NanoGPT(nn.Module):
         pos_emb = self.positional_embedding(pos_emb_seq)
         x = token_emb + pos_emb
         x = self.blocks(x)
-        x = self.lm_pred(x)
+        if self.configs["multi_token_pred"]["do_mtp"]:
+            x = self.mtp_head(x, token_emb)
+        else:
+            x = self.lm_pred(x)
         return x
 
     def generate_greedy(self, idx, max_new_tokens):
