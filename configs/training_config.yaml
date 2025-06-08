@@ -1,0 +1,21 @@
+training:
+  val_freq: 2
+  log_freq: 10000
+  batch_size: 2
+  block_size: 32
+  max_epochs: 10
+  max_iters: 5000
+  learning_rate: 1e-3
+  seed: 1337
+  num_workers: 12
+  pin_memory: true
+
+model:
+  n_embd: 64
+  n_head: 8
+  n_layer: 8
+
+data:
+  train_file: "Harry_Potter_all_books_preprocessed.txt"
+  val_file: "Harry_Potter_all_books_preprocessed.txt"
+  tokenizer: "char" 

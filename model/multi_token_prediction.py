@@ -15,35 +15,28 @@ class MultiTokenPred(nn.Module):
         self.rms_norm = nn.RMSNorm(configs["emb_dim"])
 
         self.projections_layers = nn.ModuleList([
-            nn.Linear(2*configs["emb_dim"], configs["emb_dim"]) for _ in range(configs["multi_toke_pred"]["num_tx_head"])
+            nn.Linear(2*configs["emb_dim"], configs["emb_dim"]) for _ in range(configs["multi_token_pred"]["num_tx_head"])
         ])
 
         self.tx_layers = nn.ModuleList([
-            TransformerBlock(configs) for _ in range(configs["multi_toke_pred"]["num_tx_head"])
+            TransformerBlock(configs) for _ in range(configs["multi_token_pred"]["num_tx_head"])
         ])
-
-        # head 0
-        # merging
-        # projection
-        # transformer layer
-        # unembedding
 
     def forward(self, init_hidden, token_emb):
         B, T, _ = token_emb.shape
-        device = token_emb.device
 
         outputs = []
-        max_i = T - self.configs["multi_toke_pred"]["total_num_token"] - 1
+        max_i = T - self.configs["multi_token_pred"]["total_num_token"] - 1
         for i in range(0, max_i+1):
             h_prev = init_hidden[:, i, :]
 
             logits_k = []
             # obtain all predicted tokens for this i by iterating over all token prediction heads
-            for k in range(self.configs["multi_toke_pred"]["num_tx_head"]):
+            for k in range(self.configs["multi_token_pred"]["num_tx_head"]):
                 future_pos = i + (k+1)
                 future_token_emb = token_emb[:, future_pos, :]
 
-                norm_init_hidden = self.rms_norm(init_hidden)
+                norm_init_hidden = self.rms_norm(h_prev)
                 norm_future_emb =self.rms_norm(future_token_emb)
 
                 merged_emb = torch.cat([norm_init_hidden, norm_future_emb], dim=-1)
@@ -54,7 +47,7 @@ class MultiTokenPred(nn.Module):
 
                 logits_k.append(self.lm_head0(curr_token_emb))
 
-                init_hidden = curr_token_emb
+                h_prev = curr_token_emb
 
             logits_k = torch.stack(logits_k, dim=1)
             outputs.append(logits_k)
