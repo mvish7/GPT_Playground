@@ -34,6 +34,7 @@ class NanoGPT(nn.Module):
         pos_emb_seq = torch.arange(T).to("cuda")
         pos_emb = self.positional_embedding(pos_emb_seq)
         x = token_emb + pos_emb
+        # todo: send in kv-cache as ip and get it as op
         x = self.blocks(x)
         if self.configs["multi_token_pred"]["do_mtp"]:
             x = self.mtp_head(x, token_emb)
@@ -41,7 +42,7 @@ class NanoGPT(nn.Module):
             x = self.lm_pred(x)
         return x
 
-    def generate_greedy(self, idx, max_new_tokens):
+    def generate_greedy(self, idx, max_new_tokens=100):
         """
         implements greedy decoding
         :param idx: ids of tokens
@@ -55,14 +56,12 @@ class NanoGPT(nn.Module):
             # get the predictions
             logits = self(idx_cond)
             # focus only on the last time step
-            logits = logits[0, -1, :] # becomes (B, C)
-            # find token with max score
-            token_id = torch.argmax(logits).unsqueeze(0)
-
-            # optionally --- apply softmax to get probabilities
-            # probs = torch_f.softmax(logits, dim=-1) # (B, C)
-            # sample from the distribution
-            # idx_next = torch.multinomial(probs, num_samples=1) # (B, 1)
+            logits = logits[:, -1, :] # becomes (B, C)
+            if self.configs["multi_token_pred"]["do_mtp"]:
+                token_id = torch.argmax(logits, dim=-2).unsqueeze(0)
+            else:
+                # find token with max score
+                token_id = torch.argmax(logits).unsqueeze(0)
 
             # append sampled index to the running sequence
             idx = torch.cat((idx.squeeze(-1), token_id), dim=-1).unsqueeze(-1) # (B, T+1)
@@ -121,5 +120,5 @@ if __name__ == "__main__":
     ip = ip.to(torch.int64)
 
     msa = NanoGPT(model_configs).to("cuda")
-    op = msa(ip)
+    op = msa.generate_greedy(ip)
     a = 1
