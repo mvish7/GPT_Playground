@@ -1,7 +1,7 @@
 
 num_blocks: 6
 num_layers: 8
-attention: multi_query  # vanilla, multi_query, group_query
+attention: vanilla  # vanilla, multi_query, group_query
 emb_dim: 64
 num_heads: 8
 block_size: 32

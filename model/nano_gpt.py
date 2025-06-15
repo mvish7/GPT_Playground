@@ -10,61 +10,75 @@ from model.multi_token_prediction import MultiTokenPred
 
 
 class NanoGPT(nn.Module):
+
     def __init__(self, configs):
         super().__init__()
         self.configs = configs
         self.block_size = configs["block_size"]
-        self.token_embedding = nn.Embedding(configs["vocab_size"], configs["emb_dim"])
+        self.token_embedding = nn.Embedding(configs["vocab_size"],
+                                            configs["emb_dim"])
         # positional embeddings -- as a  block_size of input will be fed to n/w at a time,shape of block_size.
-        self.positional_embedding = nn.Embedding(configs["block_size"], configs["emb_dim"])
+        self.positional_embedding = nn.Embedding(configs["block_size"],
+                                                 configs["emb_dim"])
         # all transformer blocks stacked together
-        self.blocks = nn.Sequential(*[TransformerBlock(configs) for _ in range(configs["num_blocks"])])
+        self.blocks = nn.Sequential(
+            *[TransformerBlock(configs) for _ in range(configs["num_blocks"])])
         if configs["multi_token_pred"]["do_mtp"]:
             self.mtp_head = MultiTokenPred(configs)
         else:
             # final prediction over all words in the vocab
             self.lm_pred = nn.Linear(configs["emb_dim"], configs["vocab_size"])
 
-    def forward(self, x):
-        # x = x.to("cpu")
+    def forward(self, x, kv_cache=None):
         B, T = x.shape
 
         token_emb = self.token_embedding(x)
-
         pos_emb_seq = torch.arange(T).to("cuda")
         pos_emb = self.positional_embedding(pos_emb_seq)
         x = token_emb + pos_emb
-        # todo: send in kv-cache as ip and get it as op
-        x = self.blocks(x)
+
+        # Initialize kv_cache if not provided
+        if kv_cache is None:
+            kv_cache = [None] * len(self.blocks)
+
+        # Process through transformer blocks
+        for block_idx, block in enumerate(self.blocks):
+            x, block_kv_cache = block(x, kv_cache[block_idx])
+            kv_cache[block_idx] = block_kv_cache
+
         if self.configs["multi_token_pred"]["do_mtp"]:
             x = self.mtp_head(x, token_emb)
         else:
             x = self.lm_pred(x)
-        return x
+        return x, kv_cache
 
     def generate_greedy(self, idx, max_new_tokens=100):
         """
-        implements greedy decoding
+        implements greedy decoding with KV cache
         :param idx: ids of tokens
         :param max_new_tokens: max num tokens to generate
         :return:
         """
-        # idx is (B, T) array of indices in the current context
+        # Prefill phase - establish KV cache
+        logits, kv_cache = self(idx)
+
+        # Decode phase - use and update KV cache
         for _ in range(max_new_tokens):
-            # crop idx to the last block_size tokens
-            idx_cond = idx[:, -self.block_size:]
-            # get the predictions
-            logits = self(idx_cond)
-            # focus only on the last time step
-            logits = logits[:, -1, :] # becomes (B, C)
+            # Get the last token's logits
+            logits = logits[:, -1, :]
+
+            # Sample next token
             if self.configs["multi_token_pred"]["do_mtp"]:
-                token_id = torch.argmax(logits, dim=-2).unsqueeze(0)
+                token_id = torch.argmax(logits, dim=2)
             else:
-                # find token with max score
                 token_id = torch.argmax(logits).unsqueeze(0)
 
-            # append sampled index to the running sequence
-            idx = torch.cat((idx.squeeze(-1), token_id), dim=-1).unsqueeze(-1) # (B, T+1)
+            # Append sampled index to the running sequence
+            idx = torch.cat((idx.squeeze(-1), token_id), dim=-1)
+
+            # Get next token's logits using KV cache
+            logits, kv_cache = self(token_id.unsqueeze(0), kv_cache)
+
         return idx[:, 0]
 
     def generate_beam_search(self, idx, max_new_tokens, beam_size):
@@ -100,8 +114,12 @@ class NanoGPT(nn.Module):
                 top_log_probs, top_token_ids = torch.topk(log_probs, beam_size)
 
                 for log_prob, token_id in zip(top_log_probs, top_token_ids):
-                    new_seq = torch.cat([seq.squeeze(-1), token_id.unsqueeze(0)], dim=-1).unsqueeze(-1)  # (B, T+1)
-                    new_score = score + log_prob.item()  # Sum of log-probabilities
+                    new_seq = torch.cat(
+                        [seq.squeeze(-1),
+                         token_id.unsqueeze(0)],
+                        dim=-1).unsqueeze(-1)  # (B, T+1)
+                    new_score = score + log_prob.item(
+                    )  # Sum of log-probabilities
                     candidates.append((new_seq, new_score))
 
             ordered = sorted(candidates, key=lambda tup: tup[1], reverse=True)
@@ -115,7 +133,8 @@ if __name__ == "__main__":
     with open("../configs/model_config.yaml", "r") as mcf:
         model_configs = yaml.safe_load(mcf)
 
-    model_configs["vocab_size"] = 71  # simulate harry_potter_text data vocab_size
+    model_configs[
+        "vocab_size"] = 71  # simulate harry_potter_text data vocab_size
     ip = torch.randint(0, 10, (2, 32)).to("cuda")
     ip = ip.to(torch.int64)
 

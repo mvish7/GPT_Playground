@@ -1,1 +1,1 @@
-from model.gpt_blocks import SelfAttention, MultiHeadAttention, TransformerBlock, FeedForward
+from model.gpt_blocks import Attention, MultiHeadAttention, MultiQueryAttention, TransformerBlock, FeedForward
