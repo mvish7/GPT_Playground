@@ -55,31 +55,47 @@ class NanoGPT(nn.Module):
     def generate_greedy(self, idx, max_new_tokens=100):
         """
         implements greedy decoding with KV cache
-        :param idx: ids of tokens
+        :param idx: ids of tokens (B, T) where B is batch size, T is sequence length
         :param max_new_tokens: max num tokens to generate
-        :return:
+        :return: generated sequence of shape (B, T+max_new_tokens)
         """
+        B, T = idx.shape
+
+        # Ensure input sequence is within block size
+        if T > self.block_size:
+            idx = idx[:, -self.block_size:]
+            T = self.block_size
+
         # Prefill phase - establish KV cache
         logits, kv_cache = self(idx)
 
         # Decode phase - use and update KV cache
         for _ in range(max_new_tokens):
             # Get the last token's logits
-            logits = logits[:, -1, :]
+            logits = logits[:, -1, :]  # (B, C) where C is vocab size
 
             # Sample next token
             if self.configs["multi_token_pred"]["do_mtp"]:
-                token_id = torch.argmax(logits, dim=2)
+                token_id = torch.argmax(logits, dim=2)  # (B, 1)
             else:
-                token_id = torch.argmax(logits).unsqueeze(0)
+                token_id = torch.argmax(logits, dim=-1).unsqueeze(-1)  # (B, 1)
 
             # Append sampled index to the running sequence
-            idx = torch.cat((idx.squeeze(-1), token_id), dim=-1)
+            idx = torch.cat([idx, token_id], dim=1)  # (B, T+1)
 
             # Get next token's logits using KV cache
-            logits, kv_cache = self(token_id.unsqueeze(0), kv_cache)
+            # Only pass the last token to the model since we have KV cache
+            # The model will use KV cache for previous tokens and only compute
+            # attention for the new token
+            logits, kv_cache = self(token_id, kv_cache)
 
-        return idx[:, 0]
+            # If sequence length exceeds block size, we need to update KV cache
+            # by recomputing it for the last block_size tokens
+            if idx.shape[1] > self.block_size:
+                idx_cond = idx[:, -self.block_size:]
+                logits, kv_cache = self(idx_cond)
+
+        return idx
 
     def generate_beam_search(self, idx, max_new_tokens, beam_size):
         """
