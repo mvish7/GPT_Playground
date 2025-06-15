@@ -114,16 +114,36 @@ class MultiQueryAttention(Attention):
         self.proj = nn.Linear(emb_dim, emb_dim)
         self.dropout = nn.Dropout(p=0.5)
 
-    def forward(self, x):
-        v_vec = self.values(x)
-        k_vec = self.key(x)
+    def forward(self, x, kv_cache=None):
+        B, T, C = x.shape
 
-        x = torch.cat([
-            self.self_attention(x, q_vec(x), k_vec, v_vec)
-            for q_vec in self.queries
-        ],
-                      dim=-1)
-        return self.dropout(self.proj(x))
+        # Calculate queries for all heads
+        q_vecs = [q_vec(x) for q_vec in self.queries]
+
+        if kv_cache is None:
+            # Prefill mode - compute and store KV cache
+            k_vec = self.key(x)
+            v_vec = self.values(x)
+            kv_cache = (k_vec, v_vec)
+        else:
+            # Decode mode - use and update KV cache
+            k_cache, v_cache = kv_cache
+            # Compute K,V for current token only
+            k_vec = self.key(x[:, -1:, :])
+            v_vec = self.values(x[:, -1:, :])
+            # Concatenate with cache
+            k_vec = torch.cat([k_cache, k_vec], dim=1)
+            v_vec = torch.cat([v_cache, v_vec], dim=1)
+            kv_cache = (k_vec, v_vec)
+
+        # Compute attention for each head using shared K,V
+        head_outputs = []
+        for q_vec in q_vecs:
+            head_out = self.self_attention(x, q_vec, k_vec, v_vec)
+            head_outputs.append(head_out)
+
+        x = torch.cat(head_outputs, dim=-1)
+        return self.dropout(self.proj(x)), kv_cache
 
 
 class GroupQueryAttention(Attention):
@@ -156,24 +176,44 @@ class GroupQueryAttention(Attention):
         self.proj = nn.Linear(emb_dim, emb_dim)
         self.dropout = nn.Dropout(p=0.5)
 
-    def forward(self, x):
+    def forward(self, x, kv_cache=None):
+        B, T, C = x.shape
+
+        # Initialize kv_cache if not provided
+        if kv_cache is None:
+            kv_cache = [None] * self.num_groups
+
         all_head_outputs = []
+        updated_kv_cache = []
 
         for g in range(self.num_groups):
-            # shared K vector for group g
-            k_vec = self.keys[g](x)
-            v_vec = self.values[g](x)
+            if kv_cache[g] is None:
+                # Prefill mode - compute and store KV cache for this group
+                k_vec = self.keys[g](x)
+                v_vec = self.values[g](x)
+                group_kv_cache = (k_vec, v_vec)
+            else:
+                # Decode mode - use and update KV cache for this group
+                k_cache, v_cache = kv_cache[g]
+                # Compute K,V for current token only
+                k_vec = self.keys[g](x[:, -1:, :])
+                v_vec = self.values[g](x[:, -1:, :])
+                # Concatenate with cache
+                k_vec = torch.cat([k_cache, k_vec], dim=1)
+                v_vec = torch.cat([v_cache, v_vec], dim=1)
+                group_kv_cache = (k_vec, v_vec)
 
+            # Process all heads in this group using shared K,V
             for h in range(self.group_size):
-                head_idx = g * self.group_size + h  # Calculate head index
-                q_vec = self.queries[head_idx](
-                    x)  # Query for this specific head
-                head_output = self.self_attention(x, q_vec, k_vec,
-                                                  v_vec)  # Use group's K and V
+                head_idx = g * self.group_size + h
+                q_vec = self.queries[head_idx](x)
+                head_output = self.self_attention(x, q_vec, k_vec, v_vec)
                 all_head_outputs.append(head_output)
 
+            updated_kv_cache.append(group_kv_cache)
+
         x = torch.cat(all_head_outputs, dim=-1)
-        return self.dropout(self.proj(x))
+        return self.dropout(self.proj(x)), updated_kv_cache
 
 
 class FeedForward(nn.Module):

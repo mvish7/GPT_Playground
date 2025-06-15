@@ -11,6 +11,6 @@ is_moe: False  # True or False
 num_experts: 4
 num_topk: 2
 multi_token_pred:
-  do_mtp: True
+  do_mtp: False
   total_num_token: 3
   num_tx_head: 3  # num_head for transformer layer inside the MTP module
