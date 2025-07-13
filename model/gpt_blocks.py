@@ -4,6 +4,9 @@ contains basic building blocks of GPT architecture
 
 import torch
 import torch.nn as nn
+from fontTools.unicodedata import block
+
+from model.positional_embeddings import RotaryPosEmbed
 import torch.nn.functional as torch_f
 
 from model.moe_blocks import SparseMoe
@@ -11,13 +14,14 @@ from model.moe_blocks import SparseMoe
 
 class Attention(nn.Module):
 
-    def __init__(self, emb_dim, head_dim, block_size):
+    def __init__(self, emb_dim, num_heads, block_size):
         super().__init__()
-        self.head_dim = head_dim
+        self.num_heads = num_heads
+        self.head_dim = emb_dim // num_heads
 
-        self.query = nn.Linear(emb_dim, head_dim, bias=False)
-        self.key = nn.Linear(emb_dim, head_dim, bias=False)
-        self.value = nn.Linear(emb_dim, head_dim, bias=False)
+        self.query = nn.Linear(emb_dim, emb_dim, bias=False)
+        self.key = nn.Linear(emb_dim, emb_dim, bias=False)
+        self.value = nn.Linear(emb_dim, emb_dim, bias=False)
 
         self.register_buffer("tril",
                              torch.tril(torch.ones(block_size, block_size)))
@@ -27,22 +31,23 @@ class Attention(nn.Module):
         B, T, C = x.shape
 
         # Calculate queries for current input
-        q = self.query(x)
+        # reshape into (b, t, mum_heads, head_dim) and transpose it to (B, num_heads, T, head_dim)
+        q = self.query(x).view(B, T, self.num_heads, self.head_dim).transpose(1, 2)
 
         if kv_cache is None:
             # Prefill mode - compute and store KV cache
-            k = self.key(x)
-            v = self.value(x)
+            k = self.key(x).view(B, T, self.num_heads, self.head_dim).transpose(1, 2)
+            v = self.value(x).view(B, T, self.num_heads, self.head_dim).transpose(1, 2)
             kv_cache = (k, v)
         else:
             # Decode mode - use and update KV cache
             k_cache, v_cache = kv_cache
             # Compute K,V for current token only
-            k = self.key(x[:, -1:, :])
-            v = self.value(x[:, -1:, :])
+            k = self.key(x[:, -1:, :]).view(B, T, self.num_heads, self.head_dim).transpose(1, 2)
+            v = self.value(x[:, -1:, :]).view(B, T, self.num_heads, self.head_dim).transpose(1, 2)
             # Concatenate with cache
-            k = torch.cat([k_cache, k], dim=1)
-            v = torch.cat([v_cache, v], dim=1)
+            k = torch.cat([k_cache, k], dim=2)
+            v = torch.cat([v_cache, v], dim=2)
             kv_cache = (k, v)
 
         return self.self_attention(x, q, k, v), kv_cache
@@ -51,7 +56,7 @@ class Attention(nn.Module):
         b, t, c = x.shape
         # all with shape B, T, C
 
-        # dot product between (B, T, C) and (B, C, T) -> (B, T, T)
+        # dot product between (B, H, T, C) and (B, H, C, T) -> (B, H, T, T)
         scaled_dot_prod = (query_vec @ key_vec.transpose(-2, -1)) * (
             self.head_dim**-0.5)
         # masking to conceal "future" tokens
@@ -61,6 +66,7 @@ class Attention(nn.Module):
         attn_prob = torch_f.softmax(masked_dot_prod, dim=-1)
         attn_prob = self.dropout(attn_prob)
         attn_scores = attn_prob @ value_vec
+        attn_scores = attn_scores.transpose(1, 2).contiguous().view(b, t, c)
         return attn_scores
 
 
@@ -68,29 +74,16 @@ class MultiHeadAttention(nn.Module):
 
     def __init__(self, num_heads, emb_dim, block_size):
         super().__init__()
+        self.emb_dim = emb_dim
+        self.num_heads = num_heads
 
-        self.mh_sa = nn.ModuleList([
-            Attention(emb_dim, emb_dim // num_heads, block_size)
-            for _ in range(num_heads)
-        ])
+        self.mh_sa = Attention(emb_dim, num_heads, block_size)
+
         self.proj = nn.Linear(emb_dim, emb_dim)
         self.dropout = nn.Dropout(p=0.5)
 
     def forward(self, x, kv_cache=None):
-        # Initialize kv_cache if not provided
-        if kv_cache is None:
-            kv_cache = [None] * len(self.mh_sa)
-
-        # Process each head with its corresponding kv_cache
-        head_outputs = []
-        updated_kv_cache = []
-
-        for head_idx, head in enumerate(self.mh_sa):
-            head_out, head_kv_cache = head(x, kv_cache[head_idx])
-            head_outputs.append(head_out)
-            updated_kv_cache.append(head_kv_cache)
-
-        x = torch.cat(head_outputs, dim=-1)
+        x, updated_kv_cache = self.mh_sa(x, kv_cache)
         x = self.dropout(self.proj(x))
         return x, updated_kv_cache
 
@@ -101,7 +94,7 @@ class MultiQueryAttention(Attention):
     """
 
     def __init__(self, num_heads, emb_dim, block_size):
-        super().__init__(emb_dim, emb_dim // num_heads, block_size)
+        super().__init__(emb_dim, num_heads, block_size)
         delattr(self, "query")
 
         self.queries = nn.ModuleList([
@@ -149,7 +142,7 @@ class MultiQueryAttention(Attention):
 class GroupQueryAttention(Attention):
 
     def __init__(self, num_heads, num_groups, emb_dim, block_size):
-        super().__init__(emb_dim, emb_dim // num_heads, block_size)
+        super().__init__(emb_dim, num_heads, block_size)
         if num_heads % num_groups != 0:
             raise ValueError(
                 "Number of heads must be divisible by number of groups")
@@ -215,6 +208,43 @@ class GroupQueryAttention(Attention):
         x = torch.cat(all_head_outputs, dim=-1)
         return self.dropout(self.proj(x)), updated_kv_cache
 
+class MultiLatentAttention(Attention):
+    def __init__(self, emb_dim, latent_dim, num_heads, block_size):
+        super().__init__(emb_dim, num_heads, block_size)
+
+        head_dim = emb_dim // num_heads
+
+        self.rope = RotaryPosEmbed(block_size, emb_dim, device="cuda:0")
+
+        self.wdkv = nn.Linear(emb_dim, latent_dim,  bias=False)
+        self.dq = nn.Linear(emb_dim, latent_dim, bias=False)
+        self.wuq = nn.Linear(emb_dim, emb_dim,  bias=False)
+        self.wuk = nn.Linear(latent_dim, emb_dim,  bias=False)
+        self.wuv = nn.Linear(latent_dim, emb_dim,  bias=False)
+        self.wkr = nn.Linear(emb_dim, emb_dim, bias=False)
+        self.wo = nn.Linear(emb_dim, emb_dim, bias=False)
+
+        self.register_buffer("absorbed_k", None)
+
+    def forward(self, x, kv_cache=None):
+        ckv = self.wdkv(x)
+        kc = self.wuk(ckv)
+        temp_wkr = self.wkr(x)
+        kr = self.rope(temp_wkr)
+
+        keys = torch.cat((kc, kr))
+
+        values = self.wuv(ckv)
+
+        a = 1
+
+
+
+
+
+
+
+
 
 class FeedForward(nn.Module):
 
@@ -249,6 +279,11 @@ class TransformerBlock(nn.Module):
                                             configs["emb_dim"],
                                             configs["block_size"],
                                             configs["num_groups"])
+        elif configs["attention"] == "multi_latent":
+            self.attn = MultiLatentAttention(configs["emb_dim"],
+                                             configs["latent_dim"],
+                                             configs["num_heads"],
+                                             configs["block_size"])
 
         self.norm1 = nn.LayerNorm(configs["emb_dim"])
         if configs["is_moe"]:
