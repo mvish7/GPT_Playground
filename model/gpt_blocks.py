@@ -96,13 +96,15 @@ class MultiQueryAttention(Attention):
     def __init__(self, num_heads, emb_dim, block_size):
         super().__init__(emb_dim, num_heads, block_size)
         delattr(self, "query")
+        delattr(self, "value")
+        delattr(self, "key")
 
-        self.queries = nn.ModuleList([
-            nn.Linear(emb_dim, emb_dim // num_heads, bias=False)
-            for _ in range(num_heads)
-        ])
-        self.key = nn.Linear(emb_dim, emb_dim // num_heads, bias=False)
-        self.values = nn.Linear(emb_dim, emb_dim // num_heads, bias=False)
+        self.num_heads = num_heads
+        self.head_dim = emb_dim // num_heads
+
+        self.queries = nn.Linear(emb_dim, emb_dim, bias=False)
+        self.key = nn.Linear(emb_dim, self.head_dim, bias=False)
+        self.value = nn.Linear(emb_dim, self.head_dim, bias=False)
 
         self.proj = nn.Linear(emb_dim, emb_dim)
         self.dropout = nn.Dropout(p=0.5)
@@ -110,61 +112,54 @@ class MultiQueryAttention(Attention):
     def forward(self, x, kv_cache=None):
         B, T, C = x.shape
 
-        # Calculate queries for all heads
-        q_vecs = [q_vec(x) for q_vec in self.queries]
+        # Calculate queries for all heads - (B, T, nH, Hd) -> (B, nH, T, Hd)
+        q_vecs = self.queries(x).view(B, T, self.num_heads, self.head_dim).transpose(1, 2)
 
         if kv_cache is None:
             # Prefill mode - compute and store KV cache
+            # both k, v in (B, T, D)
             k_vec = self.key(x)
-            v_vec = self.values(x)
+            v_vec = self.value(x)
             kv_cache = (k_vec, v_vec)
         else:
             # Decode mode - use and update KV cache
             k_cache, v_cache = kv_cache
             # Compute K,V for current token only
+            # k and v in (B, 1, D)
             k_vec = self.key(x[:, -1:, :])
-            v_vec = self.values(x[:, -1:, :])
+            v_vec = self.value(x[:, -1:, :])
             # Concatenate with cache
             k_vec = torch.cat([k_cache, k_vec], dim=1)
             v_vec = torch.cat([v_cache, v_vec], dim=1)
             kv_cache = (k_vec, v_vec)
 
         # Compute attention for each head using shared K,V
-        head_outputs = []
-        for q_vec in q_vecs:
-            head_out = self.self_attention(x, q_vec, k_vec, v_vec)
-            head_outputs.append(head_out)
+        # q is (B, nH, T, Hd) and (k,v) are in (B, T, D) -> (k and v) are shared for each head hence broadcasting
+        x = self.self_attention(x, q_vecs, k_vec.unsqueeze(1), v_vec.unsqueeze(1))
 
-        x = torch.cat(head_outputs, dim=-1)
         return self.dropout(self.proj(x)), kv_cache
 
 
 class GroupQueryAttention(Attention):
 
-    def __init__(self, num_heads, num_groups, emb_dim, block_size):
+    def __init__(self, num_heads, emb_dim, block_size, num_groups):
         super().__init__(emb_dim, num_heads, block_size)
         if num_heads % num_groups != 0:
             raise ValueError(
                 "Number of heads must be divisible by number of groups")
 
         delattr(self, "query")  # Remove the individual query from base class
+        delattr(self, "key")
+        delattr(self, "value")
 
+        self.num_heads = num_heads
+        self.head_dim = emb_dim // num_heads
         self.num_groups = num_groups
         self.group_size = num_heads // num_groups  # Heads per group
 
-        self.queries = nn.ModuleList([
-            nn.Linear(emb_dim, emb_dim // num_heads, bias=False)
-            for _ in range(num_heads)
-        ])
-        # single k-v per group
-        self.keys = nn.ModuleList([
-            nn.Linear(emb_dim, emb_dim // num_heads, bias=False)
-            for _ in range(num_groups)
-        ])
-        self.values = nn.ModuleList([
-            nn.Linear(emb_dim, emb_dim // num_heads, bias=False)
-            for _ in range(num_groups)
-        ])
+        self.queries = nn.Linear(emb_dim, emb_dim, bias=False)
+        self.keys = nn.Linear(emb_dim, emb_dim, bias=False)
+        self.values = nn.Linear(emb_dim, emb_dim, bias=False)
 
         self.proj = nn.Linear(emb_dim, emb_dim)
         self.dropout = nn.Dropout(p=0.5)
@@ -172,41 +167,46 @@ class GroupQueryAttention(Attention):
     def forward(self, x, kv_cache=None):
         B, T, C = x.shape
 
-        # Initialize kv_cache if not provided
+        # q: (B, T, num_heads, head_dim) -> (B, num_heads, T, head_dim)
+        q = self.queries(x).view(B, T, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
+
         if kv_cache is None:
-            kv_cache = [None] * self.num_groups
+            # k/v: (B, T, C) -> (B, T, num_groups, group_size, head_dim)
+            k_full = self.keys(x).view(B, T, self.num_groups, self.group_size, self.head_dim)
+            # Since KV are shared across group_size heads, pick only the first head in each group
+            k = k_full[:, :, :, 0, :]  # (B, T, num_groups, head_dim)
+            k = k.permute(0, 2, 1, 3).contiguous()  # (B, num_groups, T, head_dim)
+            # broadcasting to match the dimensions to query -- just repeat across num_groups dimensions
+            k = k.repeat_interleave(self.group_size, dim=1)
 
-        all_head_outputs = []
-        updated_kv_cache = []
+            v_full = self.values(x).view(B, T, self.num_groups, self.group_size, self.head_dim)
+            v = v_full[:, :, :, 0, :]  # (B, T, num_groups, head_dim)
+            v = v.permute(0, 2, 1, 3).contiguous()  # (B, num_groups, T, head_dim)
+            v = v.repeat_interleave(self.group_size, dim=1)
 
-        for g in range(self.num_groups):
-            if kv_cache[g] is None:
-                # Prefill mode - compute and store KV cache for this group
-                k_vec = self.keys[g](x)
-                v_vec = self.values[g](x)
-                group_kv_cache = (k_vec, v_vec)
-            else:
-                # Decode mode - use and update KV cache for this group
-                k_cache, v_cache = kv_cache[g]
-                # Compute K,V for current token only
-                k_vec = self.keys[g](x[:, -1:, :])
-                v_vec = self.values[g](x[:, -1:, :])
-                # Concatenate with cache
-                k_vec = torch.cat([k_cache, k_vec], dim=1)
-                v_vec = torch.cat([v_cache, v_vec], dim=1)
-                group_kv_cache = (k_vec, v_vec)
+            kv_cache = (k, v)
+        else:
+            k_cache, v_cache = kv_cache
+            # calculating k for only last token
+            # k with shape (B, T, num_groups, group_size, head_dim)
+            k =  self.keys(x[:, -1, :]).view(B, T, self.num_groups, self.group_size, self.head_dim)
+            k = k[:, :, :, 0, :]  # (B, T, num_groups, head_dim)
+            k = k.permute(0, 2, 1, 3).contiguous()  # (B, num_groups, T, head_dim)
+            # broadcasting to match the dimensions to query -- just repeat across num_groups dimensions
+            k = k.repeat_interleave(self.group_size, dim=1)
+            k_cache = torch.cat((k_cache, k), dim=2)
 
-            # Process all heads in this group using shared K,V
-            for h in range(self.group_size):
-                head_idx = g * self.group_size + h
-                q_vec = self.queries[head_idx](x)
-                head_output = self.self_attention(x, q_vec, k_vec, v_vec)
-                all_head_outputs.append(head_output)
+            # calculating v for last token
+            v = self.values(x[:, -1, :]).view(B, T, self.num_groups, self.group_size, self.head_dim)
+            v = v[:, :, :, 0, :]  # (B, T, num_groups, head_dim)
+            v = v.permute(0, 2, 1, 3).contiguous()  # (B, num_groups, T, head_dim)
+            v = v.repeat_interleave(self.group_size, dim=1)
+            v_cache = torch.cat((v_cache, v), dim=2)
+            kv_cache = (k_cache, v_cache)
 
-            updated_kv_cache.append(group_kv_cache)
+        x = self.self_attention(x, q, k, v)
 
-        x = torch.cat(all_head_outputs, dim=-1)
-        return self.dropout(self.proj(x)), updated_kv_cache
+        return self.dropout(self.proj(x)), kv_cache
 
 class MultiLatentAttention(Attention):
     def __init__(self, emb_dim, latent_dim, num_heads, block_size):
