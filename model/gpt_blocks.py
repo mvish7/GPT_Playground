@@ -209,41 +209,60 @@ class GroupQueryAttention(Attention):
         return self.dropout(self.proj(x)), kv_cache
 
 class MultiLatentAttention(Attention):
-    def __init__(self, emb_dim, latent_dim, num_heads, block_size):
+    def __init__(self, emb_dim, latent_dim, num_heads, block_size, residual_head_dim):
         super().__init__(emb_dim, num_heads, block_size)
 
-        head_dim = emb_dim // num_heads
+        self.head_dim = emb_dim // num_heads
+        self.num_heads = num_heads
+        self.residual_head_dim = residual_head_dim
 
-        self.rope = RotaryPosEmbed(block_size, emb_dim, device="cuda:0")
+        self.rope = RotaryPosEmbed(block_size, self.residual_head_dim, device="cuda:0")
 
         self.wdkv = nn.Linear(emb_dim, latent_dim,  bias=False)
         self.dq = nn.Linear(emb_dim, latent_dim, bias=False)
-        self.wuq = nn.Linear(emb_dim, emb_dim,  bias=False)
+        self.wuq = nn.Linear(latent_dim, emb_dim,  bias=False)
         self.wuk = nn.Linear(latent_dim, emb_dim,  bias=False)
         self.wuv = nn.Linear(latent_dim, emb_dim,  bias=False)
-        self.wkr = nn.Linear(emb_dim, emb_dim, bias=False)
+        self.wkr = nn.Linear(emb_dim, self.num_heads * residual_head_dim, bias=False)
+        self.wqr = nn.Linear(latent_dim, self.num_heads * residual_head_dim, bias=False)
         self.wo = nn.Linear(emb_dim, emb_dim, bias=False)
 
         self.register_buffer("absorbed_k", None)
 
     def forward(self, x, kv_cache=None):
-        ckv = self.wdkv(x)
-        kc = self.wuk(ckv)
-        temp_wkr = self.wkr(x)
-        kr = self.rope(temp_wkr)
+        B, T, C = x.shape
 
-        keys = torch.cat((kc, kr))
+        if kv_cache is None:
+            ckv = self.wdkv(x)
+            decoupled_k = self.wkr(x).view(B, T, self.num_heads, self.residual_head_dim).permute(0, 2, 1, 3)
+            kr = self.rope(decoupled_k)
+            kv_cache = (ckv, kr)
+        else:
+            ckv, kr = kv_cache
+            temp_ckv = self.wdkv(x[:, :, -1])
+            temp_decoupled_k = self.wkr(x[:, :, -1]).view(B, T, self.num_heads, self.residual_head_dim).permute(0, 2, 1, 3)
+            temp_kr = self.rope(temp_decoupled_k)
 
-        values = self.wuv(ckv)
+            ckv = torch.cat((ckv, temp_ckv), dim=1)
+            kr = torch.cat((kr,temp_kr), dim=1)
 
-        a = 1
+            kv_cache = (ckv, kr)
 
+        kc = self.wuk(ckv).view(B, T, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
+        k = torch.cat((kc, kr), dim=-1)  # (B, H, T+T, dH)
 
+        v = self.wuv(ckv).view(B, T, self.num_heads, self.head_dim).permute(0, 2, 1, 3) # (B, H, T, dH)
 
+        cq = self.dq(x)
+        qc = self.wuq(cq).view(B, T, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
+        temp_qr = self.wqr(cq).view(B, T, self.num_heads, self.residual_head_dim).permute(0, 2, 1, 3)
+        qr = self.rope(temp_qr)
 
+        q = torch.cat((qc, qr), dim=-1)  # (B, H, T+T, dH)
 
+        x = self.self_attention(x, q, k, v)
 
-
+        return x, kv_cache
 
 
 class FeedForward(nn.Module):
@@ -283,7 +302,8 @@ class TransformerBlock(nn.Module):
             self.attn = MultiLatentAttention(configs["emb_dim"],
                                              configs["latent_dim"],
                                              configs["num_heads"],
-                                             configs["block_size"])
+                                             configs["block_size"],
+                                             configs["residual_head_dim"])
 
         self.norm1 = nn.LayerNorm(configs["emb_dim"])
         if configs["is_moe"]:

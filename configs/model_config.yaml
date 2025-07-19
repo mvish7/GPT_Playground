@@ -1,14 +1,16 @@
 
 num_blocks: 6
 num_layers: 8
-attention: vanilla  # vanilla, multi_query, group_query
+attention: multi_latent  # vanilla, multi_query, group_query, multi_latent
 emb_dim: 64
 num_heads: 8
 block_size: 32
+latent_dim: 4  # only applicable for multi_latent_attention
+residual_head_dim: 4  # only applicable for multi_latent_attention
 num_groups: 4  # used only for group_query_attention, num_heads % num_groups == 0
 vocab_size: 0  # to be set after train dataset creation, for now
-is_moe: False  # True or False
-num_experts: 4
+is_moe: False  # when True creates a MoE based LM
+num_experts: 4 # only applicable when MoE is True
 num_topk: 2
 multi_token_pred:
   do_mtp: False
